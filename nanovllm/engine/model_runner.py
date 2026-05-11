@@ -27,6 +27,9 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        # Keep Sequence.block_size in sync with the configured cache block size so
+        # that num_blocks / last_block_num_tokens / block() all use the right value.
+        Sequence.block_size = config.kvcache_block_size
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")

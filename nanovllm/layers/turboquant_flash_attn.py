@@ -32,6 +32,9 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         block_table: Optional[torch.Tensor] = None,
         *additional_cache_tensors,
     ) -> torch.Tensor:
+        # additional_cache_tensors (quantization metadata) are not forwarded to
+        # flash_attn_varlen_func because that function does not accept them; prefill
+        # always uses the full-precision q/k/v produced by the model.
         return flash_attn_varlen_func(
             q,
             k,
@@ -43,7 +46,6 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             softmax_scale=scale,
             causal=True,
             block_table=block_table,
-            *additional_cache_tensors,
         )
 
     def decode(
@@ -61,6 +63,9 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         elif q.ndim == 3 and q.shape[1] != 1:
             q = q.unsqueeze(1)
 
+        # additional_cache_tensors (k_norms, v_scales, v_zeros, k_centroids, rotation)
+        # are not forwarded: flash_attn_with_kvcache does not accept them.  A future
+        # fused TurboQuant decode kernel should handle dequantization internally.
         return flash_attn_with_kvcache(
             q,
             k_cache,
@@ -69,5 +74,4 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
             block_table=block_table,
             softmax_scale=scale,
             causal=True,
-            *additional_cache_tensors,
         )

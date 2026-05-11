@@ -62,7 +62,11 @@ class BlockManager:
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            # Never seal the last block: may_append() manages its lifecycle during
+            # decode.  Sealing it here would cause the `assert last_block.hash == -1`
+            # in may_append() branch-2 to fail on the first decode step whenever the
+            # prompt length is an exact multiple of block_size.
+            h = self.compute_hash(token_ids, h) if (len(token_ids) == self.block_size and i < seq.num_blocks - 1) else -1
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True

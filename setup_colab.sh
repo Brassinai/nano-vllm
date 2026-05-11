@@ -56,7 +56,7 @@ else
     pip install -q torch>=2.4.0
 fi
 
-pip install -q transformers>=4.51.0 xxhash
+pip install -q transformers>=4.51.0 xxhash tqdm
 
 # Install Triton (platform-specific)
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -149,7 +149,7 @@ import os
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
-model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+model_name = "Qwen/Qwen3-0.6B"
 model_dir = Path("$MODEL_DIR") / "Qwen3-0.6B"
 
 # Create directory
