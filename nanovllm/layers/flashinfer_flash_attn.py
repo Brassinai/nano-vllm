@@ -32,12 +32,12 @@ def _validate_flashinfer_cache_dtype(
         )
 
 
-def _use_fp16_qk_reduction(tensor: torch.Tensor) -> bool:
-    if tensor.dtype != torch.float16 or tensor.device.type != "cuda":
-        return False
-    major, _ = torch.cuda.get_device_capability(tensor.device)
-    # Pre-Ampere GPUs can fail to launch FlashInfer's fp32-QK FP16 prefill template.
-    return major < 8
+def _select_flashinfer_backend(device: torch.device) -> str:
+    if device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability(device)
+        if major < 8:
+            return "fa2"
+    return "auto"
 
 
 def _build_page_metadata(
@@ -139,6 +139,7 @@ class FlashInferAttention(BaseFlashAttentionBackend):
             wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                 self._get_workspace(device, dtype),
                 "NHD",
+                backend=_select_flashinfer_backend(device),
             )
             self._ragged_prefill_wrappers[key] = wrapper
         return wrapper
@@ -155,6 +156,7 @@ class FlashInferAttention(BaseFlashAttentionBackend):
             wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                 self._get_workspace(device, dtype),
                 "NHD",
+                backend=_select_flashinfer_backend(device),
             )
             self._paged_prefill_wrappers[key] = wrapper
         return wrapper
@@ -333,7 +335,6 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 k.shape[1],
                 q.shape[2],
                 causal=True,
-                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
@@ -361,7 +362,6 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 q.shape[2],
                 page_size,
                 causal=True,
-                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
@@ -382,7 +382,6 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 q.shape[2],
                 page_size,
                 causal=True,
-                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
