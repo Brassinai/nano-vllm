@@ -49,7 +49,8 @@ class ModelRunner:
             mapping = {
                 "float16": torch.float16,
                 "half": torch.float16,
-                "bfloat16": torch.bfloat16,
+                "bfloat16": torch.float16,
+                "bf16": torch.float16,
                 "float32": torch.float32,
                 "float": torch.float32,
             }
@@ -59,12 +60,7 @@ class ModelRunner:
 
     def _resolve_model_dtype(self, raw_dtype) -> torch.dtype:
         dtype = self._normalize_torch_dtype(raw_dtype)
-        major, minor = torch.cuda.get_device_capability(self.rank)
-        if dtype == torch.bfloat16 and major < 8:
-            warnings.warn(
-                "Model config requests bfloat16, but this GPU does not support native BF16 "
-                f"(compute capability {major}.{minor}). Falling back to float16."
-            )
+        if dtype == torch.bfloat16:
             return torch.float16
         return dtype
 

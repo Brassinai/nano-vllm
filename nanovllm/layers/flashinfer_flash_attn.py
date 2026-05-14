@@ -32,6 +32,14 @@ def _validate_flashinfer_cache_dtype(
         )
 
 
+def _use_fp16_qk_reduction(tensor: torch.Tensor) -> bool:
+    if tensor.dtype != torch.float16 or tensor.device.type != "cuda":
+        return False
+    major, _ = torch.cuda.get_device_capability(tensor.device)
+    # Pre-Ampere GPUs can fail to launch FlashInfer's fp32-QK FP16 prefill template.
+    return major < 8
+
+
 def _build_page_metadata(
     block_table: torch.Tensor,
     seqlens: torch.Tensor,
@@ -325,6 +333,7 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 k.shape[1],
                 q.shape[2],
                 causal=True,
+                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
@@ -352,6 +361,7 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 q.shape[2],
                 page_size,
                 causal=True,
+                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
@@ -372,6 +382,7 @@ class FlashInferAttention(BaseFlashAttentionBackend):
                 q.shape[2],
                 page_size,
                 causal=True,
+                use_fp16_qk_reduction=_use_fp16_qk_reduction(q),
                 sm_scale=scale,
                 q_data_type=q.dtype,
                 kv_data_type=k.dtype,
