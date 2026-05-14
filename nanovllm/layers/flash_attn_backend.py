@@ -98,6 +98,11 @@ class BaseFlashAttentionBackend(ABC):
         return False
 
     @property
+    def requires_paged_prefill_cache(self) -> bool:
+        """Whether prefill should read from the paged KV cache after store()."""
+        return False
+
+    @property
     def supports_cudagraph_capture(self) -> bool:
         """Whether decode can be safely captured inside a CUDA graph."""
         return True
@@ -192,6 +197,7 @@ def ensure_builtin_backends_registered() -> None:
     for module_name in (
         "nanovllm.layers.default_flash_attn",
         "nanovllm.layers.int8_flash_attn",
+        "nanovllm.layers.saw_int4_flash_attn",
         "nanovllm.layers.turboquant_flash_attn",
     ):
         importlib.import_module(module_name)
