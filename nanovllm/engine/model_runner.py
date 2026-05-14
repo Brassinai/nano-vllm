@@ -207,11 +207,13 @@ class ModelRunner:
         # Count number of layers that need cache (for correct memory calculation)
         num_cache_layers = hf_config.num_hidden_layers
         
-        # Calculate number of blocks accounting for all layers
-        # Each layer gets its own cache, so divide by num_layers
-        config.num_kvcache_blocks = int(
-            total * config.gpu_memory_utilization - used - peak + current
-        ) // (num_cache_layers * block_bytes)
+        # Calculate number of blocks accounting for all layers. Each layer gets
+        # its own cache, so divide by num_layers. If num_kvcache_blocks is set,
+        # honor it; this is useful for fixed-capacity memory-footprint tests.
+        if config.num_kvcache_blocks <= 0:
+            config.num_kvcache_blocks = int(
+                total * config.gpu_memory_utilization - used - peak + current
+            ) // (num_cache_layers * block_bytes)
         assert config.num_kvcache_blocks > 0, \
             f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes * num_cache_layers} bytes"
         

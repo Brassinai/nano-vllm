@@ -139,42 +139,21 @@ def _load_packed_indices(
         ).to(tl.int32)
         return ((packed >> bit_shift) & 0xF).to(tl.int32)
 
-    group_idx = d_offs // 8
-    lane = d_offs % 8
-    byte_base = group_idx * 3
-    b0 = tl.load(
-        cache_ptr + base + byte_base,
-        mask=d_mask & (byte_base < packed_bytes),
+    bit_off = d_offs * 3
+    byte_idx = bit_off // 8
+    bit_shift = bit_off % 8
+    raw0 = tl.load(
+        cache_ptr + base + byte_idx,
+        mask=d_mask & (byte_idx < packed_bytes),
         other=0,
     ).to(tl.int32)
-    b1 = tl.load(
-        cache_ptr + base + byte_base + 1,
-        mask=d_mask & ((byte_base + 1) < packed_bytes),
+    raw1 = tl.load(
+        cache_ptr + base + byte_idx + 1,
+        mask=d_mask & ((byte_idx + 1) < packed_bytes),
         other=0,
     ).to(tl.int32)
-    b2 = tl.load(
-        cache_ptr + base + byte_base + 2,
-        mask=d_mask & ((byte_base + 2) < packed_bytes),
-        other=0,
-    ).to(tl.int32)
-
-    idx0 = b0 & 0x7
-    idx1 = (b0 >> 3) & 0x7
-    idx2 = ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2)
-    idx3 = (b1 >> 1) & 0x7
-    idx4 = (b1 >> 4) & 0x7
-    idx5 = ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1)
-    idx6 = (b2 >> 2) & 0x7
-    idx7 = (b2 >> 5) & 0x7
-
-    idx = tl.where(lane == 0, idx0, idx1)
-    idx = tl.where(lane == 2, idx2, idx)
-    idx = tl.where(lane == 3, idx3, idx)
-    idx = tl.where(lane == 4, idx4, idx)
-    idx = tl.where(lane == 5, idx5, idx)
-    idx = tl.where(lane == 6, idx6, idx)
-    idx = tl.where(lane == 7, idx7, idx)
-    return idx.to(tl.int32)
+    raw16 = raw0 | (raw1 << 8)
+    return ((raw16 >> bit_shift) & 0x7).to(tl.int32)
 
 
 @triton.jit

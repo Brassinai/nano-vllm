@@ -89,6 +89,9 @@ class CandidateResult:
     phases: dict[str, dict[str, Any]] = field(default_factory=dict)
     peak_memory_allocated_gb: float | None = None
     peak_memory_reserved_gb: float | None = None
+    cache_memory_gb: float | None = None
+    cache_bytes_per_token: float | None = None
+    num_kvcache_blocks: int | None = None
     error: str | None = None
     traceback: str | None = None
 
@@ -110,6 +113,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--num-kvcache-blocks",
+        type=int,
+        default=-1,
+        help=(
+            "Use a fixed KV-cache block count. Set this when comparing actual "
+            "cache memory footprint; the default auto mode lets smaller formats "
+            "allocate more blocks from the same memory budget."
+        ),
+    )
     parser.add_argument(
         "--eager",
         action="store_true",
@@ -228,6 +241,49 @@ def maybe_cuda_peak_memory() -> tuple[float | None, float | None]:
         return None, None
 
 
+def cache_memory_stats(llm: Any) -> tuple[float | None, float | None, int | None]:
+    runner = getattr(llm, "model_runner", None)
+    if runner is None:
+        return None, None, None
+    config = getattr(runner, "config", None)
+    model = getattr(runner, "model", None)
+    if config is None or model is None:
+        return None, None, None
+
+    seen: set[tuple[str, int]] = set()
+    total_bytes = 0
+    cache_layers = 0
+    for module in model.modules():
+        if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            cache_layers += 1
+        tensors = []
+        if hasattr(module, "k_cache"):
+            tensors.append(module.k_cache)
+        if hasattr(module, "v_cache"):
+            tensors.append(module.v_cache)
+        tensors.extend(getattr(module, "additional_cache_tensors", ()) or ())
+        for tensor in tensors:
+            if not hasattr(tensor, "numel") or tensor.numel() == 0:
+                continue
+            if tensor.device.type == "cuda":
+                key = (str(tensor.device), int(tensor.data_ptr()))
+            else:
+                key = (str(tensor.device), id(tensor))
+            if key in seen:
+                continue
+            seen.add(key)
+            total_bytes += tensor.numel() * tensor.element_size()
+
+    cache_gb = total_bytes / (1024**3)
+    num_blocks = getattr(config, "num_kvcache_blocks", None)
+    block_size = getattr(runner, "block_size", None)
+    if num_blocks and block_size and cache_layers:
+        cache_bytes_per_token = total_bytes / (cache_layers * num_blocks * block_size)
+    else:
+        cache_bytes_per_token = None
+    return cache_gb, cache_bytes_per_token, num_blocks
+
+
 def run_requests(llm: Any, prompts: list[list[int]], sampling_params: Any) -> PhaseMetrics:
     for prompt in prompts:
         llm.add_request(prompt, sampling_params)
@@ -302,6 +358,7 @@ def run_worker(args: argparse.Namespace) -> CandidateResult:
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            num_kvcache_blocks=args.num_kvcache_blocks,
         )
         try:
             warmup_sp = SamplingParams(
@@ -327,12 +384,16 @@ def run_worker(args: argparse.Namespace) -> CandidateResult:
                 phases["cold"] = run_requests(llm, cold_prompts, bench_sp).to_json()
 
             peak_allocated, peak_reserved = maybe_cuda_peak_memory()
+            cache_gb, cache_bytes_per_token, num_kvcache_blocks = cache_memory_stats(llm)
             return CandidateResult(
                 ok=True,
                 backend=args.backend or "unknown",
                 phases=phases,
                 peak_memory_allocated_gb=peak_allocated,
                 peak_memory_reserved_gb=peak_reserved,
+                cache_memory_gb=cache_gb,
+                cache_bytes_per_token=cache_bytes_per_token,
+                num_kvcache_blocks=num_kvcache_blocks,
             )
         finally:
             llm.exit()
@@ -387,6 +448,8 @@ def child_args(args: argparse.Namespace, backend: str) -> list[str]:
         str(args.max_num_seqs),
         "--gpu-memory-utilization",
         str(args.gpu_memory_utilization),
+        "--num-kvcache-blocks",
+        str(args.num_kvcache_blocks),
     ]
     if args.eager:
         cmd.append("--eager")
@@ -457,7 +520,7 @@ def print_summary(results: list[CandidateResult]) -> None:
         print(f"\nPhase: {phase}")
         print(
             "rank  backend                 wall_s  speedup  prefill_tok/s  "
-            "decode_tok/s  e2e_out_tok/s  hit_ratio  peak_GB"
+            "decode_tok/s  e2e_out_tok/s  hit_ratio  blocks  B/tok/l  cache_GB  peak_GB"
         )
         for rank, (_, result, metrics) in enumerate(rows, start=1):
             wall = metrics.get("wall_time_s")
@@ -471,12 +534,17 @@ def print_summary(results: list[CandidateResult]) -> None:
                 f"{fmt(metrics.get('decode_tps'), 1):>12}  "
                 f"{fmt(metrics.get('end_to_end_tps'), 1):>13}  "
                 f"{fmt(metrics.get('hit_ratio')):>9}  "
+                f"{result.num_kvcache_blocks if result.num_kvcache_blocks is not None else 'n/a':>6}  "
+                f"{fmt(result.cache_bytes_per_token, 0):>7}  "
+                f"{fmt(result.cache_memory_gb, 2):>8}  "
                 f"{fmt(result.peak_memory_reserved_gb, 2):>7}"
             )
 
     print(
         "\nRead it as: lower wall_s is better, higher tok/s is better, and "
-        "cache_hit hit_ratio should be close to prefix_len / (prefix_len + suffix_len)."
+        "cache_hit hit_ratio should be close to prefix_len / (prefix_len + suffix_len). "
+        "For true cache footprint comparisons, use the same --num-kvcache-blocks "
+        "across backends and compare cache_GB; B/tok/l is storage density."
     )
 
 
