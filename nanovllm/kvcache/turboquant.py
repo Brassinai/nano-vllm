@@ -227,25 +227,32 @@ def store_kvcache_turboquant_kernel(
     ).to(tl.float32)
     safe_key_norm = tl.where(key_norm > 0.0, key_norm, 1.0)
 
-    key_indices = tl.zeros((head_dim,), dtype=tl.int32)
-    for i in tl.static_range(num_boundaries):
-        boundary = tl.load(boundaries_ptr + i)
-        key_indices += (rotated_key > boundary).to(tl.int32)
+    key_lo = tl.zeros((head_dim,), dtype=tl.int32)
+    key_hi = tl.full((head_dim,), num_boundaries, dtype=tl.int32)
+    for _ in tl.static_range(0, key_bits):
+        key_mid = (key_lo + key_hi) >> 1
+        safe_mid = tl.minimum(key_mid, num_boundaries - 1)
+        boundary = tl.load(boundaries_ptr + safe_mid)
+        key_go_right = rotated_key >= boundary
+        key_lo = tl.where(key_go_right, key_mid + 1, key_lo)
+        key_hi = tl.where(key_go_right, key_hi, key_mid)
+    key_indices = tl.minimum(key_lo, num_boundaries)
 
     key_cache_base = (slot * num_heads + head_idx) * key_packed_bytes
     if key_bits == 4:
         key_pairs = tl.reshape(key_indices, (head_dim // 2, 2))
-        key_lo, key_hi = tl.split(key_pairs)
-        key_packed = key_lo | (key_hi << 4)
+        shifts_4bit = tl.arange(0, 2) * 4
+        key_packed = tl.sum((key_pairs & 0xF) << shifts_4bit[None, :], axis=1)
         key_pair_offs = tl.arange(0, head_dim // 2)
         tl.store(k_cache_ptr + key_cache_base + key_pair_offs, key_packed.to(tl.uint8))
     else:
         key_groups = tl.reshape(key_indices, (head_dim // 8, 8))
-        k0, k1, k2, k3, k4, k5, k6, k7 = tl.split(key_groups)
+        shifts_3bit = tl.arange(0, 8) * 3
+        key_packed_24 = tl.sum((key_groups & 0x7) << shifts_3bit[None, :], axis=1)
         key_group_offs = tl.arange(0, head_dim // 8) * 3
-        key_b0 = k0 | (k1 << 3) | ((k2 & 0x3) << 6)
-        key_b1 = ((k2 >> 2) & 0x1) | (k3 << 1) | (k4 << 4) | ((k5 & 0x1) << 7)
-        key_b2 = ((k5 >> 1) & 0x3) | (k6 << 2) | (k7 << 5)
+        key_b0 = key_packed_24 & 0xFF
+        key_b1 = (key_packed_24 >> 8) & 0xFF
+        key_b2 = (key_packed_24 >> 16) & 0xFF
         tl.store(k_cache_ptr + key_cache_base + key_group_offs, key_b0.to(tl.uint8))
         tl.store(k_cache_ptr + key_cache_base + key_group_offs + 1, key_b1.to(tl.uint8))
         tl.store(k_cache_ptr + key_cache_base + key_group_offs + 2, key_b2.to(tl.uint8))
@@ -267,17 +274,18 @@ def store_kvcache_turboquant_kernel(
     value_cache_base = (slot * num_heads + head_idx) * value_packed_bytes
     if value_bits == 4:
         value_pairs = tl.reshape(value_indices, (head_dim // 2, 2))
-        value_lo, value_hi = tl.split(value_pairs)
-        value_packed = value_lo | (value_hi << 4)
+        shifts_4bit = tl.arange(0, 2) * 4
+        value_packed = tl.sum((value_pairs & 0xF) << shifts_4bit[None, :], axis=1)
         value_pair_offs = tl.arange(0, head_dim // 2)
         tl.store(v_cache_ptr + value_cache_base + value_pair_offs, value_packed.to(tl.uint8))
     else:
         value_groups = tl.reshape(value_indices, (head_dim // 8, 8))
-        v0, v1, v2, v3, v4, v5, v6, v7 = tl.split(value_groups)
+        shifts_3bit = tl.arange(0, 8) * 3
+        value_packed_24 = tl.sum((value_groups & 0x7) << shifts_3bit[None, :], axis=1)
         value_group_offs = tl.arange(0, head_dim // 8) * 3
-        value_b0 = v0 | (v1 << 3) | ((v2 & 0x3) << 6)
-        value_b1 = ((v2 >> 2) & 0x1) | (v3 << 1) | (v4 << 4) | ((v5 & 0x1) << 7)
-        value_b2 = ((v5 >> 1) & 0x3) | (v6 << 2) | (v7 << 5)
+        value_b0 = value_packed_24 & 0xFF
+        value_b1 = (value_packed_24 >> 8) & 0xFF
+        value_b2 = (value_packed_24 >> 16) & 0xFF
         tl.store(v_cache_ptr + value_cache_base + value_group_offs, value_b0.to(tl.uint8))
         tl.store(v_cache_ptr + value_cache_base + value_group_offs + 1, value_b1.to(tl.uint8))
         tl.store(v_cache_ptr + value_cache_base + value_group_offs + 2, value_b2.to(tl.uint8))

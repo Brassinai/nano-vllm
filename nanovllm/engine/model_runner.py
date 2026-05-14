@@ -286,12 +286,25 @@ class ModelRunner:
             )
         ):    # prefix cache or cache-backed quantized prefill
             block_tables = self.prepare_block_tables(seqs)
+        cu_seqlens_q_cpu = list(cu_seqlens_q)
+        cu_seqlens_k_cpu = list(cu_seqlens_k)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+            cu_seqlens_k_cpu=cu_seqlens_k_cpu,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

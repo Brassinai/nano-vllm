@@ -30,6 +30,7 @@ from nanovllm.layers.flash_attn_backend import (
 )
 from nanovllm.layers.attn_utils import normalize_decode_query
 from nanovllm.layers.flashinfer_flash_attn import FlashInferAttention
+from nanovllm.utils.context import get_context
 
 
 @triton.jit
@@ -233,6 +234,147 @@ def _packed_continuation_decode_attention_kernel(
 
     out = acc / l_prev
     out_base = token_idx * out_stride_token + head_idx * out_stride_head
+    tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
+
+
+@triton.jit
+def _packed_batched_continuation_decode_attention_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_norms_ptr,
+    v_scales_ptr,
+    v_zeros_ptr,
+    k_centroids_ptr,
+    block_table_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    out_ptr,
+    q_stride_token,
+    q_stride_head,
+    k_cache_stride_block,
+    k_cache_stride_pos,
+    k_cache_stride_head,
+    v_cache_stride_block,
+    v_cache_stride_pos,
+    v_cache_stride_head,
+    meta_stride_block,
+    meta_stride_pos,
+    meta_stride_head,
+    block_table_stride_batch,
+    block_table_stride_block,
+    out_stride_token,
+    out_stride_head,
+    max_seq_len,
+    kv_group_size,
+    softmax_scale,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    key_bits: tl.constexpr,
+    value_bits: tl.constexpr,
+    key_packed_bytes: tl.constexpr,
+    value_packed_bytes: tl.constexpr,
+    centroid_count: tl.constexpr,
+    block_d: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    token_off = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
+    kv_head = head_idx // kv_group_size
+
+    q_start = tl.load(cu_seqlens_q_ptr + batch_idx).to(tl.int32)
+    q_end = tl.load(cu_seqlens_q_ptr + batch_idx + 1).to(tl.int32)
+    q_len = q_end - q_start
+    if token_off >= q_len:
+        return
+
+    k_start = tl.load(cu_seqlens_k_ptr + batch_idx).to(tl.int32)
+    k_end = tl.load(cu_seqlens_k_ptr + batch_idx + 1).to(tl.int32)
+    seq_len = k_end - k_start
+    cached_len = seq_len - q_len
+    visible_len = cached_len + token_off + 1
+
+    d_offs = tl.arange(0, block_d)
+    d_mask = d_offs < head_dim
+    q_token = q_start + token_off
+    q_base = q_token * q_stride_token + head_idx * q_stride_head
+    q = tl.load(q_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+
+    m_prev = -float("inf")
+    l_prev = 0.0
+    acc = tl.zeros([block_d], dtype=tl.float32)
+
+    for start_n in tl.range(0, max_seq_len, block_k):
+        kv_idx = start_n + tl.arange(0, block_k)
+        kv_mask = kv_idx < visible_len
+
+        page_idx = kv_idx // block_size
+        page_off = kv_idx % block_size
+        block_num = tl.load(
+            block_table_ptr
+            + batch_idx * block_table_stride_batch
+            + page_idx * block_table_stride_block,
+            mask=kv_mask,
+            other=0,
+        ).to(tl.int64)
+
+        k_base = (
+            block_num * k_cache_stride_block
+            + page_off.to(tl.int64) * k_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * k_cache_stride_head
+        )
+        meta_base = (
+            block_num * meta_stride_block
+            + page_off.to(tl.int64) * meta_stride_pos
+            + tl.cast(kv_head, tl.int64) * meta_stride_head
+        )
+
+        k_idx = _load_packed_indices(
+            k_cache_ptr,
+            k_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            key_bits,
+            key_packed_bytes,
+        )
+        k_idx = tl.where(d_mask[None, :], k_idx, 0)
+        centroid_mask = kv_mask[:, None] & d_mask[None, :] & (k_idx < centroid_count)
+        k_vals = tl.load(k_centroids_ptr + k_idx, mask=centroid_mask, other=0.0).to(tl.float32)
+        k_norm = tl.load(k_norms_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        k = k_vals * k_norm[:, None]
+
+        scores = tl.sum(q[None, :] * k, axis=1) * softmax_scale
+        scores = tl.where(kv_mask, scores, -float("inf"))
+
+        m_curr = tl.max(scores, axis=0)
+        m_next = tl.maximum(m_prev, m_curr)
+        alpha = tl.exp(m_prev - m_next)
+        probs = tl.exp(scores - m_next)
+
+        v_base = (
+            block_num * v_cache_stride_block
+            + page_off.to(tl.int64) * v_cache_stride_pos
+            + tl.cast(kv_head, tl.int64) * v_cache_stride_head
+        )
+        v_idx = _load_packed_indices(
+            v_cache_ptr,
+            v_base[:, None],
+            d_offs[None, :],
+            kv_mask[:, None] & d_mask[None, :],
+            value_bits,
+            value_packed_bytes,
+        ).to(tl.float32)
+        v_scale = tl.load(v_scales_ptr + meta_base, mask=kv_mask, other=1.0).to(tl.float32)
+        v_zero = tl.load(v_zeros_ptr + meta_base, mask=kv_mask, other=0.0).to(tl.float32)
+        v = v_idx * v_scale[:, None] + v_zero[:, None]
+
+        acc = acc * alpha + tl.sum(probs[:, None] * v, axis=0)
+        l_prev = l_prev * alpha + tl.sum(probs, axis=0)
+        m_prev = m_next
+
+    out = acc / l_prev
+    out_base = q_token * out_stride_token + head_idx * out_stride_head
     tl.store(out_ptr + out_base + d_offs, out.to(out_ptr.dtype.element_ty), mask=d_mask)
 
 
@@ -661,6 +803,72 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         )
         return output
 
+    def _run_batched_small_continuation_prefill_packed(
+        self,
+        q_rot: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        k_norms: torch.Tensor,
+        v_scales: torch.Tensor,
+        v_zeros: torch.Tensor,
+        k_centroids: torch.Tensor,
+        max_q_len: int,
+        max_seq_len: int,
+        scale: float,
+        key_bits: int,
+        value_bits: int,
+    ) -> torch.Tensor:
+        output = torch.empty_like(q_rot)
+        block_d = triton.next_power_of_2(q_rot.shape[-1])
+        block_k = 32
+        kv_group_size = q_rot.shape[1] // k_cache.shape[2]
+        _packed_batched_continuation_decode_attention_kernel[
+            (max_q_len, q_rot.shape[1], block_table.shape[0])
+        ](
+            q_rot,
+            k_cache,
+            v_cache,
+            k_norms,
+            v_scales,
+            v_zeros,
+            k_centroids,
+            block_table,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            output,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            k_norms.stride(0),
+            k_norms.stride(1),
+            k_norms.stride(2),
+            block_table.stride(0),
+            block_table.stride(1),
+            output.stride(0),
+            output.stride(1),
+            max_seq_len,
+            kv_group_size,
+            scale,
+            head_dim=q_rot.shape[-1],
+            block_size=k_cache.shape[1],
+            key_bits=key_bits,
+            value_bits=value_bits,
+            key_packed_bytes=k_cache.shape[-1],
+            value_packed_bytes=v_cache.shape[-1],
+            centroid_count=k_centroids.numel(),
+            block_d=block_d,
+            block_k=block_k,
+        )
+        return output
+
     def _run_small_continuation_prefill(
         self,
         q_rot: torch.Tensor,
@@ -714,11 +922,22 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
         key_bits = _bits_from_centroid_count(k_centroids.numel())
         head_dim = rotation.shape[-1]
         value_bits = (v_cache.shape[-1] * 8) // head_dim
-        output = torch.empty_like(q)
-        q_starts = cu_seqlens_q.to(torch.int64).tolist()
-        k_starts = cu_seqlens_k.to(torch.int64).tolist()
+        context = get_context()
+        expected_start_count = block_table.shape[0] + 1
+        if (
+            context.cu_seqlens_q_cpu is not None
+            and context.cu_seqlens_k_cpu is not None
+            and len(context.cu_seqlens_q_cpu) == expected_start_count
+            and len(context.cu_seqlens_k_cpu) == expected_start_count
+        ):
+            q_starts = context.cu_seqlens_q_cpu
+            k_starts = context.cu_seqlens_k_cpu
+        else:
+            q_starts = cu_seqlens_q.to(torch.int64).tolist()
+            k_starts = cu_seqlens_k.to(torch.int64).tolist()
         max_q_len = 0
         max_seq_len = 0
+        all_small_continuation = block_table.shape[0] > 0
         for req_idx in range(block_table.shape[0]):
             q_len = q_starts[req_idx + 1] - q_starts[req_idx]
             seq_len = k_starts[req_idx + 1] - k_starts[req_idx]
@@ -726,6 +945,34 @@ class TurboQuantFlashAttention(BaseFlashAttentionBackend):
                 max_q_len = q_len
             if seq_len > max_seq_len:
                 max_seq_len = seq_len
+            cached_len = seq_len - q_len
+            if not (
+                q_len > 0
+                and cached_len > 0
+                and q_len <= self.turboquant_config.small_prefill_threshold
+            ):
+                all_small_continuation = False
+        if all_small_continuation:
+            q_rot = self._rotate_query_for_turboquant(q, rotation)
+            return self._run_batched_small_continuation_prefill_packed(
+                q_rot,
+                k_cache,
+                v_cache,
+                block_table,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                k_norms,
+                v_scales,
+                v_zeros,
+                k_centroids,
+                max_q_len,
+                max_seq_len,
+                scale,
+                key_bits,
+                value_bits,
+            )
+
+        output = torch.empty_like(q)
         q_positions = self._get_arange_cache(max_q_len, q.device, torch.int64)
         k_positions = self._get_arange_cache(max_seq_len, q.device, torch.int64)
 
