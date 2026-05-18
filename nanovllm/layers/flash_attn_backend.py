@@ -1,7 +1,8 @@
 """Base flash attention backend interface for nano-vllm."""
 from abc import ABC, abstractmethod
+import importlib
 import torch
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class BaseFlashAttentionBackend(ABC):
@@ -26,6 +27,7 @@ class BaseFlashAttentionBackend(ABC):
         max_seqlen_k: Optional[int],
         cu_seqlens_k: Optional[torch.Tensor],
         block_table: Optional[torch.Tensor] = None,
+        *additional_cache_tensors,
     ) -> torch.Tensor:
         """
         Perform prefill attention (processing prompt tokens).
@@ -40,6 +42,7 @@ class BaseFlashAttentionBackend(ABC):
             max_seqlen_k: Maximum sequence length in the batch for keys
             cu_seqlens_k: Cumulative sequence lengths for keys
             block_table: Optional block table for prefix caching
+            *additional_cache_tensors: Optional metadata for quantized cache backends
             
         Returns:
             Output tensor [total_tokens, num_heads, head_dim]
@@ -88,6 +91,38 @@ class BaseFlashAttentionBackend(ABC):
     def name(self) -> str:
         """Name of the backend implementation."""
         return self.__class__.__name__
+
+    @property
+    def supports_quantized_cache_inputs(self) -> bool:
+        """Whether the backend consumes packed KV cache tensors directly."""
+        return False
+
+    @property
+    def requires_paged_prefill_cache(self) -> bool:
+        """Whether prefill should read from the paged KV cache after store()."""
+        return False
+
+    @property
+    def supports_cudagraph_capture(self) -> bool:
+        """Whether decode can be safely captured inside a CUDA graph."""
+        return True
+
+    def begin_cudagraph_capture(self, batch_size: int, max_num_blocks: int) -> None:
+        """Prepare backend state for capturing a fixed decode batch size."""
+        return None
+
+    def end_cudagraph_capture(self) -> None:
+        """Clear any temporary capture-only backend state."""
+        return None
+
+    def prepare_cudagraph_replay(
+        self,
+        batch_size: int,
+        cache_seqlens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Update backend metadata buffers before replaying a captured decode graph."""
+        return None
 
 
 class FlashAttentionRegistry:
@@ -141,6 +176,7 @@ class FlashAttentionRegistry:
         Raises:
             KeyError: If backend is not registered
         """
+        ensure_builtin_backends_registered()
         if name not in cls._registry:
             available = ", ".join(cls._registry.keys())
             raise KeyError(
@@ -152,4 +188,16 @@ class FlashAttentionRegistry:
     @classmethod
     def list_backends(cls) -> list[str]:
         """List all registered backend names."""
+        ensure_builtin_backends_registered()
         return list(cls._registry.keys())
+
+
+def ensure_builtin_backends_registered() -> None:
+    """Import built-in backend modules so their registry decorators run."""
+    for module_name in (
+        "nanovllm.layers.default_flash_attn",
+        "nanovllm.layers.int8_flash_attn",
+        "nanovllm.layers.saw_int4_flash_attn",
+        "nanovllm.layers.turboquant_flash_attn",
+    ):
+        importlib.import_module(module_name)

@@ -18,8 +18,10 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+For standard installs with FlashInfer:
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install "nano-vllm[flashinfer] @ git+https://github.com/GeeeekExplorer/nano-vllm.git"
 ```
 
 ## Model Download
@@ -46,6 +48,20 @@ outputs[0]["text"]
 ## Benchmark
 
 See `bench.py` for benchmark.
+
+For a TurboQuant KV-cache comparison across this repo and upstream vLLM, use:
+
+```bash
+python3 scripts/benchmark_turboquant_compare.py \
+  --model ~/huggingface/Qwen3-0.6B/ \
+  --nano-backends default,turboquant \
+  --vllm-kv-cache-dtypes auto,turboquant_4bit_nc \
+  --json-out turboquant_results.json
+```
+
+The comparison script runs each candidate in a fresh subprocess, seeds a shared
+prefix for the cache-hit phase, then reports cold/cache-hit wall time,
+throughput, prefix-cache hit ratio where available, and peak CUDA memory.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
