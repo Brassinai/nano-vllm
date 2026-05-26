@@ -72,7 +72,12 @@ class ModelRegistry:
         return cls._registry[name]
     
     @classmethod
-    def create_model(cls, config: PretrainedConfig, model_name: str | None = None) -> BaseModel:
+    def create_model(
+        cls,
+        config: PretrainedConfig,
+        model_name: str | None = None,
+        quant_config=None,
+    ) -> BaseModel:
         """
         Create a model instance from config.
         
@@ -104,7 +109,7 @@ class ModelRegistry:
             model_name = cls._arch_to_model[arch]
         
         model_cls = cls.get_model_class(model_name)
-        return model_cls(config)
+        return model_cls(config, quant_config=quant_config)
     
     @classmethod
     def list_models(cls) -> list[str]:
