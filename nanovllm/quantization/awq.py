@@ -218,13 +218,6 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, raw_config: dict[str, Any]) -> "AWQConfig":
-        modules_to_not_convert = cls.get_from_keys_or(
-            raw_config,
-            ("modules_to_not_convert",),
-            None,
-        )
-        if modules_to_not_convert:
-            raise ValueError("AWQ modules_to_not_convert is not supported yet.")
         return cls(
             bits=int(cls.get_from_keys(raw_config, ("bits", "w_bit"))),
             group_size=int(cls.get_from_keys(raw_config, ("group_size", "q_group_size"))),
