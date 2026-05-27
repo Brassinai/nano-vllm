@@ -10,9 +10,11 @@ from nanovllm.quantization.gptq_export import (
 )
 
 # Register built-in backends.
+from nanovllm.quantization.awq import AWQConfig
 from nanovllm.quantization.gptq import GPTQConfig
 
 __all__ = [
+    "AWQConfig",
     "GPTQConfig",
     "GPTQExportConfig",
     "QuantizationConfig",
