@@ -71,6 +71,7 @@ CANONICAL_KV_ORDER = (
 )
 DEFAULT_MODEL_QUANTIZATIONS = "none,gptq"
 DEFAULT_KV_BACKENDS = ",".join(CANONICAL_KV_ORDER)
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 @dataclass
@@ -199,6 +200,15 @@ def resolve_candidate_model(
     # Only the shared fallback model can be auto-downloaded. Backend-specific
     # checkpoints are expected to already exist locally.
     if chosen == os.path.expanduser(fallback_model):
+        if model_quantization == "gptq" and model_quantization not in quantization_models:
+            quantize_config = Path(chosen) / "quantize_config.json"
+            if not quantize_config.is_file():
+                raise FileNotFoundError(
+                    "gptq was selected, but --model points to a dense model directory. "
+                    "Either pass --auto-prepare-gptq so the benchmark first quantizes "
+                    "that dense model, or pass --quantization-models "
+                    "gptq=/path/to/prequantized-model."
+                )
         return ensure_model(chosen, hf_model_id, download_if_missing)
 
     if not path.is_dir():
@@ -207,6 +217,11 @@ def resolve_candidate_model(
             f"{path}. Pass --quantization-models {model_quantization}=/path/to/model."
         )
     return str(path.resolve())
+
+
+def default_gptq_output_model(model: str, bits: int, group_size: int) -> str:
+    src = Path(os.path.expanduser(model)).resolve()
+    return str(src.parent / f"{src.name}-gptq-w{bits}-g{group_size}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -276,6 +291,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-cold", action="store_true")
     parser.add_argument("--json-out", type=str, default=None)
+    parser.add_argument(
+        "--auto-prepare-gptq",
+        action="store_true",
+        help=(
+            "If gptq is selected and no gptq model path is provided, quantize "
+            "--model into a local GPTQ checkpoint before benchmarking."
+        ),
+    )
+    parser.add_argument(
+        "--gptq-output-model",
+        type=str,
+        default=None,
+        help="Destination directory for auto-prepared GPTQ checkpoints.",
+    )
+    parser.add_argument("--gptq-bits", type=int, default=4, choices=(2, 4, 8))
+    parser.add_argument("--gptq-group-size", type=int, default=128)
+    parser.add_argument("--gptq-nsamples", type=int, default=32)
+    parser.add_argument("--gptq-seqlen", type=int, default=512)
+    parser.add_argument(
+        "--gptq-calibration-file",
+        type=str,
+        default=None,
+        help="Optional text file with calibration lines for auto-prepared GPTQ.",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--worker-model-quantization",
@@ -296,6 +335,63 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     return parser.parse_args()
+
+
+def ensure_auto_prepared_gptq(
+    args: argparse.Namespace,
+    quantization_models: dict[str, str],
+) -> dict[str, str]:
+    if "gptq" in quantization_models or not args.auto_prepare_gptq:
+        return quantization_models
+
+    output_model = args.gptq_output_model or default_gptq_output_model(
+        args.model,
+        args.gptq_bits,
+        args.gptq_group_size,
+    )
+    output_path = Path(os.path.expanduser(output_model)).resolve()
+    if output_path.is_dir() and (output_path / "quantize_config.json").is_file():
+        updated = dict(quantization_models)
+        updated["gptq"] = str(output_path)
+        return updated
+
+    print("\n=== Preparing gptq model from dense source ===", flush=True)
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "quantize_gptq.py"),
+        "--model",
+        args.model,
+        "--output",
+        str(output_path),
+        "--bits",
+        str(args.gptq_bits),
+        "--group-size",
+        str(args.gptq_group_size),
+        "--nsamples",
+        str(args.gptq_nsamples),
+        "--seqlen",
+        str(args.gptq_seqlen),
+    ]
+    if args.gptq_calibration_file:
+        cmd.extend(["--calibration-file", args.gptq_calibration_file])
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Auto GPTQ preparation failed.\n"
+            f"Command: {' '.join(cmd)}\n\n"
+            f"{proc.stdout[-4000:]}"
+        )
+    if proc.stdout.strip():
+        print(proc.stdout.strip().splitlines()[-1], flush=True)
+    updated = dict(quantization_models)
+    updated["gptq"] = str(output_path)
+    return updated
 
 
 def run_worker(args: argparse.Namespace) -> MatrixResult:
@@ -584,6 +680,8 @@ def main() -> None:
     model_quantizations = expand_model_quantizations(args.model_quantizations)
     kv_backends = expand_kv_backends(args.kv_backends)
     quantization_models = parse_quantization_models(args.quantization_models)
+    if "gptq" in model_quantizations:
+        quantization_models = ensure_auto_prepared_gptq(args, quantization_models)
     resolved_models = {
         model_quantization: resolve_candidate_model(
             model_quantization,

@@ -11,6 +11,12 @@ from transformers import Qwen3Config
 import nanovllm.models.qwen3  # noqa: F401
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.quantization import QuantizationRegistry
+from nanovllm.quantization.gptq_export import (
+    pack_qweight,
+    pack_qzeros,
+    unpack_qweight,
+    unpack_qzeros,
+)
 from nanovllm.quantization.gptq import GPTQConfig, GPTQLinearMethod
 
 
@@ -90,6 +96,38 @@ def test_gptq_fused_module_selection_requires_all_checkpoint_shards():
     quant_config.quantized_modules.remove("model.layers.0.self_attn.v_proj")
     with pytest.raises(ValueError, match="part of fused layer"):
         quant_config._is_layer_quantized("model.layers.0.self_attn.qkv_proj")
+
+
+def test_gptq_weight_packing_roundtrips():
+    q_int = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [7, 6, 5, 4, 3, 2, 1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_qweight(q_int, bits=4)
+    unpacked = unpack_qweight(packed, bits=4, out_features=q_int.shape[0])
+
+    assert packed.shape == (1, 2)
+    assert torch.equal(unpacked, q_int)
+
+
+def test_gptq_zero_packing_roundtrips():
+    qzeros = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [7, 6, 5, 4, 3, 2, 1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_qzeros(qzeros, bits=4)
+    unpacked = unpack_qzeros(packed, bits=4, out_features=qzeros.shape[1])
+
+    assert packed.shape == (2, 1)
+    assert torch.equal(unpacked, qzeros)
 
 
 def test_model_runner_applies_gptq_quantization_to_engine_model(monkeypatch, tmp_path):
