@@ -435,6 +435,7 @@ class GPTQExportConfig:
     device: str = "cuda"
 
 
+@torch.inference_mode()
 def quantize_hf_model(
     model: nn.Module,
     calibration_batches: list[torch.Tensor],
@@ -442,6 +443,8 @@ def quantize_hf_model(
     *,
     device: str,
 ) -> dict[str, GPTQTensorPack]:
+    if torch.is_grad_enabled():
+        raise RuntimeError("GPTQ export should run with gradients disabled.")
     use_cache = getattr(model.config, "use_cache", False)
     model.config.use_cache = False
     try:
@@ -638,8 +641,10 @@ def export_gptq_checkpoint(
         model_path,
         dtype=load_dtype,
         low_cpu_mem_usage=True,
+        device_map="cpu",
     )
     model.eval()
+    model.requires_grad_(False)
 
     texts = calibration_texts or list(DEFAULT_CALIBRATION_TEXTS)
     batches = make_calibration_batches(
