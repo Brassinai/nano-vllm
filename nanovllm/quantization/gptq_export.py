@@ -467,6 +467,14 @@ def quantize_hf_model(
                 super().__init__()
                 self.module = module
 
+            def __getattr__(self, name: str):
+                if name == "module":
+                    return super().__getattr__(name)
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
             def forward(self, inp: torch.Tensor, *args, **kwargs):
                 inps[cache["i"]] = inp.squeeze(0)
                 cache["i"] += 1
@@ -628,7 +636,7 @@ def export_gptq_checkpoint(
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=load_dtype,
+        dtype=load_dtype,
         low_cpu_mem_usage=True,
     )
     model.eval()
