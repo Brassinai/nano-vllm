@@ -18,6 +18,14 @@ from nanovllm.quantization.gptq_export import (
     unpack_qzeros,
 )
 from nanovllm.quantization.awq import AWQConfig, AWQLinearMethod
+from nanovllm.quantization.awq_export import (
+    AWQExportConfig,
+    pack_awq_qweight,
+    pack_awq_qzeros,
+    quantize_awq_linear,
+    unpack_awq_qweight,
+    unpack_awq_qzeros,
+)
 from nanovllm.quantization.gptq import GPTQConfig, GPTQLinearMethod
 
 
@@ -190,6 +198,66 @@ def test_gptq_zero_packing_roundtrips():
 
     assert packed.shape == (2, 1)
     assert torch.equal(unpacked, qzeros)
+
+
+def test_awq_weight_packing_roundtrips():
+    q_int = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [4, 5],
+            [6, 7],
+            [7, 6],
+            [5, 4],
+            [3, 2],
+            [1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_awq_qweight(q_int, bits=4)
+    unpacked = unpack_awq_qweight(packed, bits=4, out_features=q_int.shape[0])
+
+    assert packed.shape == (2, 1)
+    assert torch.equal(unpacked, q_int)
+
+
+def test_awq_zero_packing_roundtrips():
+    qzeros = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [7, 6, 5, 4, 3, 2, 1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_awq_qzeros(qzeros, bits=4)
+    unpacked = unpack_awq_qzeros(packed, bits=4, out_features=qzeros.shape[1])
+
+    assert packed.shape == (2, 1)
+    assert torch.equal(unpacked, qzeros)
+
+
+def test_awq_export_quantizes_linear_to_runtime_layout():
+    layer = nn.Linear(16, 8, bias=False)
+    input_scale = torch.linspace(0.1, 1.0, steps=16)
+    config = AWQExportConfig(
+        bits=4,
+        group_size=8,
+        clip_steps=2,
+        min_clip_ratio=0.9,
+        device="cpu",
+        dtype="float32",
+    )
+
+    packed = quantize_awq_linear(layer, input_scale, config)
+
+    assert packed.qweight.shape == (16, 1)
+    assert packed.qzeros.shape == (2, 1)
+    assert packed.scales.shape == (2, 8)
+    assert packed.qweight.dtype == torch.int32
+    assert packed.qzeros.dtype == torch.int32
+    assert packed.scales.dtype == torch.float16
 
 
 def test_model_runner_applies_gptq_quantization_to_engine_model(monkeypatch, tmp_path):
