@@ -2,7 +2,7 @@
 """Benchmark model-weight quantization against KV-cache quantization.
 
 This script sweeps a matrix of:
-- model-weight quantization backends such as ``none`` and ``gptq``
+- model-weight quantization backends such as ``none``, ``awq``, and ``gptq``
 - KV-cache backends such as ``default``, ``int8``, ``int4``, and TurboQuant
 
 Each candidate runs in a fresh subprocess so CUDA memory, NCCL state, and JIT
@@ -18,12 +18,19 @@ canonical KV-cache quantizers:
       --model-quantizations none,gptq \
       --quantization-models gptq=~/huggingface/Qwen3-0.6B-GPTQ
 
+Benchmark the dense baseline and AWQ:
+
+    python3 scripts/benchmark_quantization_matrix.py \
+      --model ~/huggingface/Qwen3-0.6B \
+      --model-quantizations none,awq \
+      --quantization-models awq=~/huggingface/Qwen3-0.6B-AWQ
+
 Ask the benchmark to include every registered model quantization backend:
 
     python3 scripts/benchmark_quantization_matrix.py \
       --model ~/huggingface/Qwen3-0.6B \
       --model-quantizations all \
-      --quantization-models gptq=~/huggingface/Qwen3-0.6B-GPTQ
+      --quantization-models awq=~/huggingface/Qwen3-0.6B-AWQ,gptq=~/huggingface/Qwen3-0.6B-GPTQ
 """
 
 from __future__ import annotations
@@ -145,6 +152,10 @@ def expand_model_quantizations(raw: str) -> list[str]:
     return expanded
 
 
+def model_quantization_all_requested(raw: str) -> bool:
+    return any(normalize_model_quantization(item) == "all" for item in csv_list(raw))
+
+
 def expand_kv_backends(raw: str) -> list[str]:
     requested = csv_list(raw)
     if not requested:
@@ -187,6 +198,75 @@ def parse_quantization_models(raw: str) -> dict[str, str]:
     return mapping
 
 
+def checkpoint_matches_quantization(model_path: str, model_quantization: str) -> bool:
+    if model_quantization == "none":
+        return True
+    path = Path(os.path.expanduser(model_path)) / "quantize_config.json"
+    if not path.is_file():
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw_config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw_config, dict):
+        return False
+
+    quant_method = str(raw_config.get("quant_method", "")).lower()
+    if quant_method:
+        return quant_method == model_quantization
+    if model_quantization == "gptq":
+        return "checkpoint_format" in raw_config or "desc_act" in raw_config
+    if model_quantization == "awq":
+        return (
+            str(raw_config.get("version", "")).lower() == "gemm"
+            and ("w_bit" in raw_config or "bits" in raw_config)
+            and ("q_group_size" in raw_config or "group_size" in raw_config)
+        )
+    return False
+
+
+def missing_quantized_model_message(model_quantization: str) -> str:
+    auto_prepare = f"--auto-prepare-{model_quantization}"
+    return (
+        f"{model_quantization} was selected, but --model does not point to a "
+        f"{model_quantization} checkpoint. Either pass {auto_prepare} so the "
+        "benchmark first quantizes that dense model, or pass "
+        f"--quantization-models {model_quantization}=/path/to/prequantized-model."
+    )
+
+
+def filter_missing_quantizations_from_all(
+    args: argparse.Namespace,
+    model_quantizations: list[str],
+    quantization_models: dict[str, str],
+) -> list[str]:
+    if not model_quantization_all_requested(args.model_quantizations):
+        return model_quantizations
+
+    runnable: list[str] = []
+    skipped: list[str] = []
+    for model_quantization in model_quantizations:
+        if (
+            model_quantization == "none"
+            or model_quantization in quantization_models
+            or checkpoint_matches_quantization(args.model, model_quantization)
+        ):
+            runnable.append(model_quantization)
+        else:
+            skipped.append(model_quantization)
+
+    if skipped:
+        print(
+            "Warning: --model-quantizations all skipped backends without a "
+            f"matching checkpoint: {', '.join(skipped)}. Pass explicit "
+            "--model-quantizations to require them, provide --quantization-models, "
+            "or use the matching --auto-prepare-* flag.",
+            flush=True,
+        )
+    return runnable
+
+
 def resolve_candidate_model(
     model_quantization: str,
     fallback_model: str,
@@ -200,15 +280,12 @@ def resolve_candidate_model(
     # Only the shared fallback model can be auto-downloaded. Backend-specific
     # checkpoints are expected to already exist locally.
     if chosen == os.path.expanduser(fallback_model):
-        if model_quantization == "gptq" and model_quantization not in quantization_models:
-            quantize_config = Path(chosen) / "quantize_config.json"
-            if not quantize_config.is_file():
-                raise FileNotFoundError(
-                    "gptq was selected, but --model points to a dense model directory. "
-                    "Either pass --auto-prepare-gptq so the benchmark first quantizes "
-                    "that dense model, or pass --quantization-models "
-                    "gptq=/path/to/prequantized-model."
-                )
+        if (
+            model_quantization != "none"
+            and model_quantization not in quantization_models
+            and not checkpoint_matches_quantization(chosen, model_quantization)
+        ):
+            raise FileNotFoundError(missing_quantized_model_message(model_quantization))
         return ensure_model(chosen, hf_model_id, download_if_missing)
 
     if not path.is_dir():
@@ -222,6 +299,11 @@ def resolve_candidate_model(
 def default_gptq_output_model(model: str, bits: int, group_size: int) -> str:
     src = Path(os.path.expanduser(model)).resolve()
     return str(src.parent / f"{src.name}-gptq-w{bits}-g{group_size}")
+
+
+def default_awq_output_model(model: str, bits: int, group_size: int) -> str:
+    src = Path(os.path.expanduser(model)).resolve()
+    return str(src.parent / f"{src.name}-awq-w{bits}-g{group_size}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,7 +327,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Optional backend-specific local model directories in the form "
-            "'gptq=/path/to/gptq-model,none=/path/to/base-model'. Backends "
+            "'awq=/path/to/awq-model,gptq=/path/to/gptq-model'. Backends "
             "without an explicit entry fall back to --model."
         ),
     )
@@ -314,6 +396,32 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional text file with calibration lines for auto-prepared GPTQ.",
+    )
+    parser.add_argument(
+        "--auto-prepare-awq",
+        action="store_true",
+        help=(
+            "If awq is selected and no awq model path is provided, quantize "
+            "--model into a local AWQ checkpoint before benchmarking."
+        ),
+    )
+    parser.add_argument(
+        "--awq-output-model",
+        type=str,
+        default=None,
+        help="Destination directory for auto-prepared AWQ checkpoints.",
+    )
+    parser.add_argument("--awq-bits", type=int, default=4, choices=(4,))
+    parser.add_argument("--awq-group-size", type=int, default=128)
+    parser.add_argument("--awq-nsamples", type=int, default=32)
+    parser.add_argument("--awq-seqlen", type=int, default=512)
+    parser.add_argument("--awq-clip-steps", type=int, default=10)
+    parser.add_argument("--awq-min-clip-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--awq-calibration-file",
+        type=str,
+        default=None,
+        help="Optional text file with calibration lines for auto-prepared AWQ.",
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -391,6 +499,67 @@ def ensure_auto_prepared_gptq(
         print(proc.stdout.strip().splitlines()[-1], flush=True)
     updated = dict(quantization_models)
     updated["gptq"] = str(output_path)
+    return updated
+
+
+def ensure_auto_prepared_awq(
+    args: argparse.Namespace,
+    quantization_models: dict[str, str],
+) -> dict[str, str]:
+    if "awq" in quantization_models or not args.auto_prepare_awq:
+        return quantization_models
+
+    output_model = args.awq_output_model or default_awq_output_model(
+        args.model,
+        args.awq_bits,
+        args.awq_group_size,
+    )
+    output_path = Path(os.path.expanduser(output_model)).resolve()
+    if output_path.is_dir() and (output_path / "quantize_config.json").is_file():
+        updated = dict(quantization_models)
+        updated["awq"] = str(output_path)
+        return updated
+
+    print("\n=== Preparing awq model from dense source ===", flush=True)
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "quantize_awq.py"),
+        "--model",
+        args.model,
+        "--output",
+        str(output_path),
+        "--bits",
+        str(args.awq_bits),
+        "--group-size",
+        str(args.awq_group_size),
+        "--nsamples",
+        str(args.awq_nsamples),
+        "--seqlen",
+        str(args.awq_seqlen),
+        "--clip-steps",
+        str(args.awq_clip_steps),
+        "--min-clip-ratio",
+        str(args.awq_min_clip_ratio),
+    ]
+    if args.awq_calibration_file:
+        cmd.extend(["--calibration-file", args.awq_calibration_file])
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Auto AWQ preparation failed.\n"
+            f"Command: {' '.join(cmd)}\n\n"
+            f"{proc.stdout[-4000:]}"
+        )
+    if proc.stdout.strip():
+        print(proc.stdout.strip().splitlines()[-1], flush=True)
+    updated = dict(quantization_models)
+    updated["awq"] = str(output_path)
     return updated
 
 
@@ -682,6 +851,13 @@ def main() -> None:
     quantization_models = parse_quantization_models(args.quantization_models)
     if "gptq" in model_quantizations:
         quantization_models = ensure_auto_prepared_gptq(args, quantization_models)
+    if "awq" in model_quantizations:
+        quantization_models = ensure_auto_prepared_awq(args, quantization_models)
+    model_quantizations = filter_missing_quantizations_from_all(
+        args,
+        model_quantizations,
+        quantization_models,
+    )
     resolved_models = {
         model_quantization: resolve_candidate_model(
             model_quantization,
