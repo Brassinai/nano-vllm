@@ -11,6 +11,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import ModelRegistry
 from nanovllm.kvcache import KVCacheRegistry
 from nanovllm.kvcache.turboquant_config import resolve_turboquant_config
+from nanovllm.quantization import resolve_quantization_config
 from nanovllm.layers.flash_attn_backend import (
     FlashAttentionRegistry,
     ensure_builtin_backends_registered,
@@ -83,8 +84,20 @@ class ModelRunner:
         torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
         
-        # Create model from registry
-        self.model = ModelRegistry.create_model(hf_config, config.model_architecture)
+        # Create model from registry. Model-weight quantization is upstream of
+        # attention/KV-cache quantization and only changes linear allocation.
+        self.quant_config = resolve_quantization_config(
+            config.quantization,
+            config.model,
+            hf_config,
+        )
+        if self.quant_config is not None:
+            self.quant_config.validate_runtime(self.model_dtype)
+        self.model = ModelRegistry.create_model(
+            hf_config,
+            config.model_architecture,
+            quant_config=self.quant_config,
+        )
         load_model(self.model, config.model)
         
         # Create KV cache backend. TurboQuant exposes several presets that share

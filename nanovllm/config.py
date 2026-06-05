@@ -18,6 +18,8 @@ class Config:
     num_kvcache_blocks: int = -1
     # Model architecture (None = auto-detect from hf_config)
     model_architecture: str | None = None
+    # Model weight quantization backend (e.g. "gptq").
+    quantization: str | None = None
     # KV cache type ("default" = no quantization, "int8", "int4", etc.)
     kvcache_type: str = "default"
 

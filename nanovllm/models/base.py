@@ -18,9 +18,10 @@ class BaseModel(nn.Module, ABC):
     # Format: {"original_name": ("packed_name", index_or_key)}
     packed_modules_mapping: dict[str, tuple[str, str | int]] = {}
     
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, quant_config=None):
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
     
     @abstractmethod
     def forward(

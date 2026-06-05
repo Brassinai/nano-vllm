@@ -26,3 +26,7 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(module)
