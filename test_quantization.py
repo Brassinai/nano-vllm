@@ -17,6 +17,15 @@ from nanovllm.quantization.gptq_export import (
     unpack_qweight,
     unpack_qzeros,
 )
+from nanovllm.quantization.awq import AWQConfig, AWQLinearMethod
+from nanovllm.quantization.awq_export import (
+    AWQExportConfig,
+    pack_awq_qweight,
+    pack_awq_qzeros,
+    quantize_awq_linear,
+    unpack_awq_qweight,
+    unpack_awq_qzeros,
+)
 from nanovllm.quantization.gptq import GPTQConfig, GPTQLinearMethod
 
 
@@ -34,6 +43,10 @@ class FakeLinear(nn.Module):
 
 def test_gptq_backend_is_registered():
     assert "gptq" in QuantizationRegistry.list_backends()
+
+
+def test_awq_backend_is_registered():
+    assert "awq" in QuantizationRegistry.list_backends()
 
 
 def test_quantization_registry_rejects_duplicate_backend_names():
@@ -58,9 +71,31 @@ def test_gptq_config_parses_checkpoint_metadata():
     assert quant_config.zero_offset == 0
 
 
+def test_awq_config_parses_checkpoint_metadata():
+    quant_config = AWQConfig.from_config(
+        {
+            "w_bit": 4,
+            "q_group_size": 32,
+            "zero_point": True,
+            "version": "gemm",
+            "modules_to_not_convert": ["lm_head"],
+        }
+    )
+
+    assert isinstance(quant_config, AWQConfig)
+    assert quant_config.bits == 4
+    assert quant_config.group_size == 32
+    assert quant_config.pack_factor == 8
+
+
 def test_gptq_rejects_activation_order_until_supported():
     with pytest.raises(ValueError, match="desc_act"):
         GPTQConfig(bits=4, group_size=32, desc_act=True)
+
+
+def test_awq_rejects_non_gemm_until_supported():
+    with pytest.raises(ValueError, match="GEMM"):
+        AWQConfig(bits=4, group_size=32, version="gemv")
 
 
 def test_gptq_linear_method_creates_packed_checkpoint_parameters():
@@ -78,8 +113,43 @@ def test_gptq_linear_method_creates_packed_checkpoint_parameters():
     assert layer.g_idx.tolist() == [0] * 32 + [1] * 32
 
 
+def test_awq_linear_method_creates_packed_checkpoint_parameters():
+    layer = FakeLinear()
+    quant_config = AWQConfig(bits=4, group_size=32)
+
+    method = quant_config.get_quant_method(layer, "fake.linear")
+
+    assert isinstance(method, AWQLinearMethod)
+    method.create_weights(layer)
+    assert layer.qweight.shape == (64, 16)
+    assert layer.qweight.dtype == torch.int32
+    assert layer.qzeros.shape == (2, 16)
+    assert layer.scales.shape == (2, 128)
+    assert layer.g_idx.tolist() == [0] * 32 + [1] * 32
+
+
 def test_gptq_fused_module_selection_requires_all_checkpoint_shards():
     quant_config = GPTQConfig(bits=4, group_size=32, desc_act=False)
+    quant_config.quantized_modules = {
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+    }
+
+    assert quant_config._is_layer_quantized(
+        "model.layers.0.self_attn.qkv_proj"
+    )
+    assert not quant_config._is_layer_quantized(
+        "model.layers.0.self_attn.o_proj"
+    )
+
+    quant_config.quantized_modules.remove("model.layers.0.self_attn.v_proj")
+    with pytest.raises(ValueError, match="part of fused layer"):
+        quant_config._is_layer_quantized("model.layers.0.self_attn.qkv_proj")
+
+
+def test_awq_fused_module_selection_requires_all_checkpoint_shards():
+    quant_config = AWQConfig(bits=4, group_size=32)
     quant_config.quantized_modules = {
         "model.layers.0.self_attn.q_proj",
         "model.layers.0.self_attn.k_proj",
@@ -128,6 +198,66 @@ def test_gptq_zero_packing_roundtrips():
 
     assert packed.shape == (2, 1)
     assert torch.equal(unpacked, qzeros)
+
+
+def test_awq_weight_packing_roundtrips():
+    q_int = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [4, 5],
+            [6, 7],
+            [7, 6],
+            [5, 4],
+            [3, 2],
+            [1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_awq_qweight(q_int, bits=4)
+    unpacked = unpack_awq_qweight(packed, bits=4, out_features=q_int.shape[0])
+
+    assert packed.shape == (2, 1)
+    assert torch.equal(unpacked, q_int)
+
+
+def test_awq_zero_packing_roundtrips():
+    qzeros = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [7, 6, 5, 4, 3, 2, 1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    packed = pack_awq_qzeros(qzeros, bits=4)
+    unpacked = unpack_awq_qzeros(packed, bits=4, out_features=qzeros.shape[1])
+
+    assert packed.shape == (2, 1)
+    assert torch.equal(unpacked, qzeros)
+
+
+def test_awq_export_quantizes_linear_to_runtime_layout():
+    layer = nn.Linear(16, 8, bias=False)
+    input_scale = torch.linspace(0.1, 1.0, steps=16)
+    config = AWQExportConfig(
+        bits=4,
+        group_size=8,
+        clip_steps=2,
+        min_clip_ratio=0.9,
+        device="cpu",
+        dtype="float32",
+    )
+
+    packed = quantize_awq_linear(layer, input_scale, config)
+
+    assert packed.qweight.shape == (16, 1)
+    assert packed.qzeros.shape == (2, 1)
+    assert packed.scales.shape == (2, 8)
+    assert packed.qweight.dtype == torch.int32
+    assert packed.qzeros.dtype == torch.int32
+    assert packed.scales.dtype == torch.float16
 
 
 def test_model_runner_applies_gptq_quantization_to_engine_model(monkeypatch, tmp_path):
@@ -202,5 +332,81 @@ def test_model_runner_applies_gptq_quantization_to_engine_model(monkeypatch, tmp
     layer = runner.model.model.layers[0]
     assert isinstance(layer.self_attn.qkv_proj.quant_method, GPTQLinearMethod)
     assert isinstance(layer.mlp.gate_up_proj.quant_method, GPTQLinearMethod)
+    assert layer.self_attn.o_proj.quant_method is None
+    assert layer.mlp.down_proj.quant_method is None
+
+
+def test_model_runner_applies_awq_quantization_to_engine_model(monkeypatch, tmp_path):
+    quantized_modules = {
+        "model.layers.0.self_attn.qkv_proj.qweight": torch.zeros(1, dtype=torch.int32),
+        "model.layers.0.mlp.gate_up_proj.qweight": torch.zeros(1, dtype=torch.int32),
+    }
+    save_file(quantized_modules, tmp_path / "model.safetensors")
+    (tmp_path / "quantize_config.json").write_text(
+        json.dumps(
+            {
+                "w_bit": 4,
+                "q_group_size": 32,
+                "zero_point": True,
+                "version": "gemm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    hf_config = Qwen3Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+    )
+    hf_config.architectures = ["Qwen3ForCausalLM"]
+    hf_config.torch_dtype = torch.float16
+
+    config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=hf_config,
+        kvcache_block_size=256,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        quantization="awq",
+        model_architecture="qwen3",
+        kvcache_type="default",
+    )
+
+    class DummyAttentionBackend:
+        name = "dummy"
+        supports_cudagraph_capture = True
+
+    monkeypatch.setattr("torch.distributed.init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 0)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 1)
+    monkeypatch.setattr("torch.cuda.set_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch, "set_default_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr("nanovllm.engine.model_runner.load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ModelRunner, "warmup_model", lambda self: None)
+    monkeypatch.setattr(ModelRunner, "allocate_kv_cache", lambda self: None)
+    monkeypatch.setattr(
+        ModelRunner,
+        "create_attn_backend",
+        lambda self, backend_name: DummyAttentionBackend(),
+    )
+
+    runner = ModelRunner(config, rank=0, event=[])
+
+    assert isinstance(runner.quant_config, AWQConfig)
+    assert runner.quant_config.quantized_modules == {
+        "model.layers.0.self_attn.qkv_proj",
+        "model.layers.0.mlp.gate_up_proj",
+    }
+
+    layer = runner.model.model.layers[0]
+    assert isinstance(layer.self_attn.qkv_proj.quant_method, AWQLinearMethod)
+    assert isinstance(layer.mlp.gate_up_proj.quant_method, AWQLinearMethod)
     assert layer.self_attn.o_proj.quant_method is None
     assert layer.mlp.down_proj.quant_method is None
