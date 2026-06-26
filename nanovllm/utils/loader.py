@@ -10,6 +10,10 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def load_model(model: nn.Module, path: str):
+    # If the model provides a custom HF loader, delegate to it.
+    load_fn = getattr(model, "load_from_pretrained", None)
+    if callable(load_fn):
+        return load_fn(path)
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:

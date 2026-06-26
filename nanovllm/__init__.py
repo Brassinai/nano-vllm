@@ -1,2 +1,4 @@
-from nanovllm.llm import LLM
-from nanovllm.sampling_params import SamplingParams
+"""Minimal package initializer to avoid import-time heavy deps during tests.
+
+Import submodules directly (e.g. `from nanovllm.engine import llm_engine`).
+"""

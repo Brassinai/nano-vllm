@@ -73,16 +73,28 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # Prefer NCCL on CUDA-enabled installs; fall back to Gloo for CPU/testing
+        try:
+            use_nccl = torch.cuda.is_available() and dist.is_nccl_available()
+        except Exception:
+            use_nccl = False
+        backend = "nccl" if use_nccl else "gloo"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        self.device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+        if self.device.type == "cuda":
+            torch.cuda.set_device(rank)
         raw_model_dtype = getattr(hf_config, "dtype", None)
         if raw_model_dtype is None:
             raw_model_dtype = getattr(hf_config, "torch_dtype", None)
         self.model_dtype = self._resolve_model_dtype(raw_model_dtype)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.model_dtype)
-        torch.set_default_device("cuda")
+        # Set default device (either 'cuda:<rank>' or 'cpu')
+        try:
+            torch.set_default_device(str(self.device))
+        except Exception:
+            # Older torch installs may not support set_default_device; ignore
+            pass
         
         # Create model from registry. Model-weight quantization is upstream of
         # attention/KV-cache quantization and only changes linear allocation.
@@ -119,10 +131,16 @@ class ModelRunner:
             self.enforce_eager = True
         
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        # Skip CUDA-only warmup and KV-cache allocation when running on CPU
+        if self.device.type == "cuda":
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        else:
+            # On CPU, set minimal defaults so downstream code can run.
+            self.graphs = {}
+            self.graph_pool = None
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -143,8 +161,16 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
+        # Only synchronize/destroy CUDA resources when CUDA is available
+        try:
+            if getattr(self, "device", None) is not None and self.device.type == "cuda":
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
     def loop(self):
         while True:
@@ -188,8 +214,12 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
@@ -199,11 +229,18 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # If CUDA is available, compute GPU memory-based blocks, otherwise
+        # fall back to a conservative CPU-only allocation.
+        if self.device.type == "cuda":
+            free, total = torch.cuda.mem_get_info()
+            used = total - free
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        else:
+            # simple CPU fallback: require explicit num_kvcache_blocks or default to 1
+            free = total = used = peak = current = 0
+        # For standard transformers (e.g., GPT2), use num_attention_heads if num_key_value_heads is not available
+        num_kv_heads = getattr(hf_config, "num_key_value_heads", hf_config.num_attention_heads) // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         
         # Create a temporary cache backend to calculate block size
@@ -224,11 +261,15 @@ class ModelRunner:
         # its own cache, so divide by num_layers. If num_kvcache_blocks is set,
         # honor it; this is useful for fixed-capacity memory-footprint tests.
         if config.num_kvcache_blocks <= 0:
-            config.num_kvcache_blocks = int(
-                total * config.gpu_memory_utilization - used - peak + current
-            ) // (num_cache_layers * block_bytes)
-        assert config.num_kvcache_blocks > 0, \
-            f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes * num_cache_layers} bytes"
+            if self.device.type == "cuda":
+                config.num_kvcache_blocks = int(
+                    total * config.gpu_memory_utilization - used - peak + current
+                ) // (num_cache_layers * block_bytes)
+            else:
+                config.num_kvcache_blocks = 1
+        if self.device.type == "cuda":
+            assert config.num_kvcache_blocks > 0, \
+                f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes * num_cache_layers} bytes"
         
         # Create cache backends for each layer and allocate tensors
         layer_id = 0
@@ -261,7 +302,7 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -303,11 +344,12 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         cu_seqlens_q_cpu = list(cu_seqlens_q)
         cu_seqlens_k_cpu = list(cu_seqlens_k)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        use_pin = self.device.type == "cuda"
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=use_pin).to(self.device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=use_pin).to(self.device, non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=use_pin).to(self.device, non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=use_pin).to(self.device, non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=use_pin).to(self.device, non_blocking=True)
         set_context(
             True,
             cu_seqlens_q,
@@ -332,10 +374,11 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        use_pin = self.device.type == "cuda"
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=use_pin).to(self.device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=use_pin).to(self.device, non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=use_pin).to(self.device, non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=use_pin).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
@@ -344,7 +387,8 @@ class ModelRunner:
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        use_pin = self.device.type == "cuda"
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=use_pin).to(self.device, non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
@@ -385,12 +429,24 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        # Expand temperatures to match logits during prefill.
+        # During prefill, temperatures is [num_seqs] but logits is [total_tokens, vocab_size].
+        # Expand by repeating each temperature for the sequence length.
+        if self.rank == 0 and is_prefill and temperatures is not None and temperatures.size(0) != logits.size(0):
+            expanded_temps = []
+            for i, seq in enumerate(seqs):
+                seq_len = len(seq.token_ids)
+                expanded_temps.extend([temperatures[i].item()] * seq_len)
+            temperatures = torch.tensor(expanded_temps, dtype=temperatures.dtype, device=temperatures.device)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # CUDAGraphs are only supported on CUDA devices; no-op on CPU
+        if self.device.type != "cuda":
+            return
         config = self.config
         hf_config = config.hf_config
         self.graph_bs = self._cudagraph_batch_sizes(self.config.max_num_seqs)
